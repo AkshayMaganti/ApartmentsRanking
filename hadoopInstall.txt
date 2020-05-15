@@ -1,0 +1,5 @@
+
+PATH=/mnt/c/Users/magan/Downloads/kafka/spark-2.4.3-bin-hadoop2.7/bin:/mnt/c/Users/magan/Downloads/kafka/jdk1.8.0_221:/opt/spark/bin:/mnt/c/Users/magan/Downloads/kafka/sbt/bin:$PATH
+export JAVA_HOME=/mnt/c/Users/magan/Downloads/kafka/jdk1.8.0_221
+export HADOOP_HOME=/mnt/c/Users/magan/Downloads/kafka/hadoop-3.2.0
+export SPARK_HOME=/mnt/c/Users/magan/Downloads/spark-2.4.3-bin-hadoop2.7

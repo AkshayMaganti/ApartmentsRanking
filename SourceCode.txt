@@ -1,0 +1,459 @@
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.spark.sql._
+import java.util.Properties
+
+object AmenitiesScore {
+  def main(args: Array[String]): Unit = {
+
+    val jdbcHostname = "webscrapercs.database.windows.net"
+    val jdbcDatabase = "webscrapercs"
+    // Create the JDBC URL without passing in the user and password parameters.
+    val jdbcUrl = s"jdbc:sqlserver://$jdbcHostname;database=$jdbcDatabase"
+
+    // Create a Properties() object to hold the parameters.
+    val connectionProperties = new Properties()
+
+    connectionProperties.put("user", s"USERNAME")
+    connectionProperties.put("password", s"PASSWORD")
+
+    val driverClass = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    connectionProperties.setProperty("Driver", driverClass)
+
+
+    val spark = SparkSession
+        .builder()
+        .appName("AmenitiesScore")
+        .getOrCreate()
+      import spark.implicits._
+      //val sc = spark.sparkContext
+      val pushdown_query1 = "(SELECT AMENITY, Property FROM PROPERTY_AMENITY_MAP WHERE PROPERTY_AMENITY_MAP.Property IN (SELECT ID FROM PROPERTY WHERE PROPERTY.ZIP IN (75252, 75080, 75082, 75074, 75093))) testAlias"
+    val collection = spark.read.jdbc(url=jdbcUrl, table=pushdown_query1, properties=connectionProperties)
+      val count = collection.count()
+      val sn = collection.map(x => (x.getInt(0),x.getInt(1)))
+    val sn1 = sn.map{case (x:Int,y:Int) => ((y,x),1)}
+    val tF = sn1.rdd.reduceByKey((x, y) => x + y)
+
+
+    val idf1 = sn1.rdd.reduceByKey((x, y) => x).map( x => (x._1._2, x._2)).reduceByKey((x, y) => x + y).map{case (x:Int, y:Int)=> (x, math.log(count/y))}
+    val weights = tF.map(x => (x._1._2, x)).join(idf1).map(x => (x._2._1._1._1, (x._1, x._2._1._2 * x._2._2)))
+    val AmScore = weights.map(x => (x._1.toInt,x._2._2.toDouble)).reduceByKey((x,y) => x+y)
+
+
+    val jaasTemplate = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"%s\" password=\"%s\";"
+    val jaasCfg = String.format(jaasTemplate, "user", "YpaoVXFeDFw7")
+
+    val kafkaProps = new Properties()
+    kafkaProps.put("bootstrap.servers", "35.226.95.178:9092")
+    kafkaProps.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaProps.put("value.serializer", "org.apache.kafka.common.serialization.DoubleSerializer")
+    kafkaProps.put("group.id", "test-producer-group")
+    kafkaProps.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaProps.put("sasl.mechanism", "PLAIN")
+    kafkaProps.put("sasl.jaas.config",
+      jaasCfg)
+
+    AmScore.foreachPartition(x => {
+      val producer = new KafkaProducer[Integer, Double](kafkaProps)
+      x.foreach(y => {
+        val z = new ProducerRecord[Integer, Double]("amenity",y._1,y._2)
+        producer.send(z)
+      })
+      producer.close()
+    })
+
+  }
+
+
+}
+
+//ExpensesScore
+
+import java.util.Properties
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions.max
+
+
+object ExpensesScore {
+  def main(args: Array[String]): Unit = {
+
+    val jdbcHostname = "webscrapercs.database.windows.net"
+    val jdbcDatabase = "webscrapercs"
+    // Create the JDBC URL without passing in the user and password parameters.
+    val jdbcUrl = s"jdbc:sqlserver://$jdbcHostname;database=$jdbcDatabase"
+
+    // Create a Properties() object to hold the parameters.
+    val connectionProperties = new Properties()
+
+    connectionProperties.put("user", s"USERNAME")
+    connectionProperties.put("password", s"PASSWORD")
+
+    val driverClass = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    connectionProperties.setProperty("Driver", driverClass)
+
+
+    val spark = SparkSession
+      .builder()
+      .appName("AmenitiesScore")
+      .getOrCreate()
+    import spark.implicits._
+    //val sc = spark.sparkContext
+    val pushdown_query1 = "(SELECT Cost, Property FROM Expenses WHERE Expenses.Property IN (SELECT ID FROM PROPERTY WHERE PROPERTY.ZIP IN (75252, 75080, 75082, 75074, 75093) AND SUBSTRING(PROPERTY.PRICE_RANGE, 0, 4) != '0-0'))) testAlias"
+    val dataExpenses = spark.read.jdbc(url=jdbcUrl, table=pushdown_query1, properties=connectionProperties)
+
+    val pushdown_query2 = "(SELECT ID, PRICE_RANGE FROM PROPERTY WHERE PROPERTY.ZIP IN (75252, 75080, 75082, 75074, 75093) AND SUBSTRING(PROPERTY.PRICE_RANGE, 0, 4) != '0-0') test3"
+    val dataRent = spark.read.jdbc(url=jdbcUrl, table=pushdown_query2, properties=connectionProperties)
+
+    val mappedExpenses = dataExpenses.map(x => (x.getString(0).split("-"), x.getInt(1)))
+    val mappedRent = dataRent.map(x => (x.getInt(0), x.getString(1).split("-")))
+
+    val expenseData = mappedExpenses.map{case (Array(a:String, b:String), c:Int) => (a.toInt,b.toInt,c.toInt)}.toDF("min", "max", "propertyid")
+    val rentData = mappedRent.map{case (c:Int, Array(a:String, b:String)) => (a.toInt,b.toInt,c.toInt)}.toDF("min", "max", "propertyid")
+    val data = expenseData.union(rentData)
+    val sumExpensesRent = data.groupBy("propertyid").sum("min", "max").orderBy("propertyid").toDF("propertyid", "minExpenseRent", "maxExpenseRent")
+    val maxMinExpensesRent = sumExpensesRent.agg(max("minExpenseRent"))
+    val maxMaxExpensesRent = sumExpensesRent.agg(max("maxExpenseRent"))
+
+    val maxMinValue = maxMinExpensesRent.head().getLong(0).toDouble
+    val maxMaxValue = maxMaxExpensesRent.head().getLong(0).toDouble
+
+    val expensesWeightsRDD = sumExpensesRent.rdd.map(x => (x.getInt(0), maxMinValue/x.getLong(1).toDouble + maxMaxValue/x.getLong(2).toDouble))
+
+
+
+
+    val jaasTemplate = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"%s\" password=\"%s\";"
+    val jaasCfg = String.format(jaasTemplate, "user", "YpaoVXFeDFw7")
+
+    val kafkaProps = new Properties()
+    kafkaProps.put("bootstrap.servers", "35.226.95.178:9092")
+    kafkaProps.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaProps.put("value.serializer", "org.apache.kafka.common.serialization.DoubleSerializer")
+    kafkaProps.put("group.id", "test-producer-group")
+    kafkaProps.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaProps.put("sasl.mechanism", "PLAIN")
+    kafkaProps.put("sasl.jaas.config",
+      jaasCfg)
+
+    expensesWeightsRDD.foreachPartition(x => {
+      val producer = new KafkaProducer[Integer, Double](kafkaProps)
+      x.foreach(y => {
+        val z = new ProducerRecord[Integer, Double]("expense",y._1,y._2)
+        producer.send(z)
+      })
+      producer.close()
+    })
+
+  }
+}
+
+//ReviewScore
+
+import java.util.Properties
+import com.databricks.spark.corenlp.functions._
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+object ReviewScore {
+  def main(args: Array[String]): Unit = {
+    val jdbcHostname = "webscrapercs.database.windows.net"
+    val jdbcDatabase = "webscrapercs"
+    // Create the JDBC URL without passing in the user and password parameters.
+    val jdbcUrl = s"jdbc:sqlserver://$jdbcHostname;database=$jdbcDatabase"
+    // Create a Properties() object to hold the parameters.
+    val connectionProperties = new Properties()
+    connectionProperties.put("user", s"USERNAME")
+    connectionProperties.put("password", s"PASSWORD")
+    val driverClass = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    connectionProperties.setProperty("Driver", driverClass)
+    val spark = SparkSession
+      .builder()
+      .appName("AmenitiesScore")
+      .getOrCreate()
+    val sc = spark.sparkContext
+    val pushdown_query1 = "(SELECT Property, Content, Rating FROM review WHERE review.Property IN (SELECT ID FROM PROPERTY WHERE PROPERTY.ZIP IN (75252, 75080, 75082, 75074, 75093))) testAlias"
+    val dataReviews = spark.read.jdbc(url=jdbcUrl, table=pushdown_query1, properties=connectionProperties).toDF("id", "text", "rating")
+    import spark.sqlContext.implicits._
+    val version = "3.7.0"
+    val baseUrl = s"http://repo1.maven.org/maven2/edu/stanford/nlp/stanford-corenlp"
+    val model = s"stanford-corenlp-$version-models.jar"
+    val url = s"$baseUrl/$version/$model"
+    if (! sc.listJars().exists(jar => jar.contains(model))) {
+      import scala.sys.process._
+      s"wget -N $url".!!
+      s"jar xf $model".!!
+      sc.addJar(model)
+    }
+    val output = dataReviews
+      .select('id, explode(ssplit('text)).as('text), 'rating)
+      .select('id, 'text, sentiment('text).as('sentiment), 'rating)
+    val avgReviewsRating = output.groupBy("id").avg("sentiment", "rating").orderBy("id").toDF("propertyid", "avgSentiment", "avgRating")
+    val reviewsWeightsRDD = avgReviewsRating.rdd.map(x => (x.getInt(0), x.getDouble(1) + x.getDouble(2)))
+    val jaasTemplate = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"%s\" password=\"%s\";"
+    val jaasCfg = String.format(jaasTemplate, "user", "YpaoVXFeDFw7")
+    val kafkaProps = new Properties()
+    kafkaProps.put("bootstrap.servers", "35.188.143.51:9092")
+    kafkaProps.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaProps.put("value.serializer", "org.apache.kafka.common.serialization.DoubleSerializer")
+    kafkaProps.put("group.id", "test-producer-group")
+    kafkaProps.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaProps.put("sasl.mechanism", "PLAIN")
+    kafkaProps.put("sasl.jaas.config",
+      jaasCfg)
+    val producer = new KafkaProducer[Integer, Double](kafkaProps)
+    reviewsWeightsRDD.collect.foreach(y => {
+      val z = new ProducerRecord[Integer, Double]("reviewscore",y._1,y._2)
+      producer.send(z)
+    })
+    producer.close()
+  }
+}
+
+//SchoolScore
+
+import java.util.Properties
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions.{min, max, col}
+import org.apache.spark.sql.expressions.Window
+
+object SchoolScore {
+  def main(args: Array[String]): Unit = {
+
+    val jdbcHostname = "webscrapercs.database.windows.net"
+    val jdbcDatabase = "webscrapercs"
+    // Create the JDBC URL without passing in the user and password parameters.
+    val jdbcUrl = s"jdbc:sqlserver://$jdbcHostname;database=$jdbcDatabase"
+
+    // Create a Properties() object to hold the parameters.
+    val connectionProperties = new Properties()
+
+    connectionProperties.put("user", s"USERNAME")
+    connectionProperties.put("password", s"PASSWORD")
+
+    val driverClass = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    connectionProperties.setProperty("Driver", driverClass)
+
+
+    val spark = SparkSession
+      .builder()
+      .appName("AmenitiesScore")
+      .getOrCreate()
+    //val sc = spark.sparkContext
+    val pushdown_query1 = "(SELECT School.Id, School.Name, Property_school.Property, School.No_of_students, School.Rating FROM School INNER JOIN Property_school ON School.Id = Property_school.School WHERE Property_school.Property IN (SELECT ID FROM PROPERTY WHERE PROPERTY.ZIP IN (75252, 75080, 75082, 75074, 75093))) testAlias"
+    val dataSchools = spark.read.jdbc(url=jdbcUrl, table=pushdown_query1, properties=connectionProperties).toDF("schoolid", "schoolname", "propertyid", "numberstudents", "rating")
+    val avgStudentsRating = dataSchools.groupBy("propertyid").avg("numberstudents", "rating").orderBy("propertyid").toDF("propertyid", "avgNumberStudents", "avgRating")
+    val minAvgStudents = avgStudentsRating.agg(min("avgNumberStudents"))
+    val minAvgSchoolRating = avgStudentsRating.agg(min("avgRating"))
+
+    val minAvgStudentsValue = minAvgStudents.head().getDouble(0)
+    val minAvgSchoolRatingValue = minAvgSchoolRating.head().getDouble(0)
+
+    val schoolsWeightsRDD = avgStudentsRating.rdd.map(x => (x.getInt(0), x.getDouble(1)/minAvgStudentsValue + x.getDouble(2)/minAvgSchoolRatingValue))
+
+
+    //Max Students School and School Name
+    val windowSpecRating = Window.partitionBy("propertyid").orderBy("propertyid")
+    val maxSchoolRatingData = dataSchools.withColumn("maxRating", max("rating") over windowSpecRating).filter(col("maxRating") === col("rating")).drop("rating", "numberstudents").toDF("schoolIdWithMaxRating", "schoolname","propertyid","maxRating")
+    val maxRatingSchoolRDD = maxSchoolRatingData.rdd.map(x => (x.getInt(2), (x.getInt(0), x.getString(1), x.getInt(3))))
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    val jaasTemplate = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"%s\" password=\"%s\";"
+    val jaasCfg = String.format(jaasTemplate, "user", "YpaoVXFeDFw7")
+
+    val kafkaProps = new Properties()
+    kafkaProps.put("bootstrap.servers", "35.226.95.178:9092")
+    kafkaProps.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaProps.put("value.serializer", "org.apache.kafka.common.serialization.DoubleSerializer")
+    kafkaProps.put("group.id", "test-producer-group")
+    kafkaProps.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaProps.put("sasl.mechanism", "PLAIN")
+    kafkaProps.put("sasl.jaas.config",
+      jaasCfg)
+
+    val kafkaPropsString = new Properties()
+    kafkaPropsString.put("bootstrap.servers", "35.226.95.178:9092")
+    kafkaPropsString.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaPropsString.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer")
+    kafkaPropsString.put("group.id", "test-producer-group")
+    kafkaPropsString.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaPropsString.put("sasl.mechanism", "PLAIN")
+    kafkaPropsString.put("sasl.jaas.config",
+      jaasCfg)
+    // school score
+    schoolsWeightsRDD.collect.foreach(
+      y => {
+        val producer = new KafkaProducer[Integer, Double](kafkaProps)
+        val z = new ProducerRecord[Integer, Double]("schoolscore",y._1,y._2)
+        producer.send(z)
+        producer.close()
+    })
+
+    //school name
+    maxRatingSchoolRDD.collect.foreach(x => {
+      val producer = new KafkaProducer[Integer, String](kafkaPropsString)
+      val z = new ProducerRecord[Integer, String]("schoolname",x._1,x._2._2)
+      producer.send(z)
+      producer.close()
+    })
+
+    //max school rating
+    maxRatingSchoolRDD.foreachPartition(x => {
+      val producer = new KafkaProducer[Integer, Double](kafkaProps)
+      x.foreach( x => {
+        val z = new ProducerRecord[Integer, Double]("schoolrating",x._1,x._2._3.toDouble)
+        producer.send(z)
+      })
+      producer.close()
+    })
+
+  }
+}
+
+//properties to kafka
+
+import java.util.Properties
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.spark.sql.SparkSession
+
+object PropertyDetailToKafka {
+  def main(args: Array[String]): Unit = {
+    val jdbcHostname = "webscrapercs.database.windows.net"
+    val jdbcDatabase = "webscrapercs"
+    // Create the JDBC URL without passing in the user and password parameters.
+    val jdbcUrl = s"jdbc:sqlserver://$jdbcHostname;database=$jdbcDatabase"
+    // Create a Properties() object to hold the parameters.
+    val connectionProperties = new Properties()
+    connectionProperties.put("user", s"USERNAME")
+    connectionProperties.put("password", s"PASSWORD")
+    val driverClass = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    connectionProperties.setProperty("Driver", driverClass)
+
+    val spark = SparkSession
+      .builder()
+      .appName("PropertyDetails")
+      .getOrCreate()
+
+    val pushdown_query1 = "(SELECT ID, NAME, ADDRESS, ZIP, PRICE_RANGE FROM PROPERTY WHERE PROPERTY.ZIP IN (75252, 75080, 75082, 75074, 75093)) testAlias"
+    val collection = spark.read.jdbc(url=jdbcUrl, table=pushdown_query1, properties=connectionProperties)
+
+    val jaasTemplate = "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"%s\" password=\"%s\";"
+    val jaasCfg = String.format(jaasTemplate, "user", "YpaoVXFeDFw7")
+
+    val kafkaProps = new Properties()
+    kafkaProps.put("bootstrap.servers", "35.226.95.178:9092")
+    kafkaProps.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaProps.put("value.serializer", "org.apache.kafka.common.serialization.DoubleSerializer")
+    kafkaProps.put("group.id", "test-producer-group")
+    kafkaProps.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaProps.put("sasl.mechanism", "PLAIN")
+    kafkaProps.put("sasl.jaas.config",
+      jaasCfg);
+
+    val kafkaPropsString = new Properties()
+    kafkaPropsString.put("bootstrap.servers", "35.226.95.178:9092")
+    kafkaPropsString.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer")
+    kafkaPropsString.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer")
+    kafkaPropsString.put("group.id", "test-producer-group")
+    kafkaPropsString.put("security.protocol", "SASL_PLAINTEXT")
+    kafkaPropsString.put("sasl.mechanism", "PLAIN")
+    kafkaPropsString.put("sasl.jaas.config",
+      jaasCfg)
+
+
+    val producerString = new KafkaProducer[Integer, String](kafkaPropsString);
+    val producerDouble = new KafkaProducer[Integer, Double](kafkaProps);
+
+    collection.collect().foreach(
+      y => {
+
+        //id - int
+        val id = y.getInt(0)
+
+        //name - string
+        val name = new ProducerRecord[Integer, String]("name", id, y.getString(1))
+        producerString.send(name)
+
+        //address - string
+        val address = new ProducerRecord[Integer, String]("address", id, y.getString(2))
+        producerString.send(address)
+
+        //zip - integer
+        val zip = new ProducerRecord[Integer, String]("zip", id, y.getInt(3).toString)
+        producerString.send(zip)
+
+        //price-range
+        val priceRange = y.getString(4).split('-')
+          //min-price - int
+          val minPrice = new ProducerRecord[Integer, Double]("minprice", id, priceRange(0).toDouble)
+          producerDouble.send(minPrice)
+
+          //max-price - int
+          val maxPrice = new ProducerRecord[Integer, Double]("maxprice", id, priceRange(1).toDouble)
+          producerDouble.send(maxPrice)
+
+
+      }
+    )
+  }
+
+}
+
+//LOGSTASH
+
+input {
+	kafka {
+		bootstrap_servers => "localhost:9092"
+		security_protocol => "SASL_PLAINTEXT"
+		sasl_mechanism => "PLAIN"
+		jaas_path => "/opt/bitnami/kafka/config/kafka_jaas.conf"
+		key_deserializer_class => "org.apache.kafka.common.serialization.IntegerDeserializer"
+		value_deserializer_class => "org.apache.kafka.common.serialization.DoubleDeserializer"
+		topics => ["amenity", "expense", "schoolscore", "reviewscore"]
+		tags => ["DoubleDeserializer"]
+	}
+	kafka {
+		bootstrap_servers => "localhost:9092"
+		security_protocol => "SASL_PLAINTEXT"
+		sasl_mechanism => "PLAIN"
+		jaas_path => "/opt/bitnami/kafka/config/kafka_jaas.conf"
+		key_deserializer_class => "org.apache.kafka.common.serialization.IntegerDeserializer"
+		value_deserializer_class => "org.apache.kafka.common.serialization.StringDeserializer"
+		topics => ["schoolname", "name", "zip", "address"]
+		tags => ["StringDeserializer"]
+	}
+}
+filter{
+	if "DoubleDeserializer" in [tags] {
+		mutate {
+			convert => {"message" => "float"}
+		}
+	}
+	
+	if "StringDeserializer" in [tags] {
+		mutate {
+			convert => {"message" => "string"}
+		}
+	}
+	
+	mutate {
+		rename => {"message" => "%{[@metadata][kafka][topic]}"}
+	}
+}
+output {
+	elasticsearch {
+		hosts => ["<YOUR_ELASTICSEARCH_URL"]
+		index => "property"
+		document_id => "%{[@metadata][kafka][key]}"
+		doc_as_upsert => true
+        action => "update"
+		manage_template => true
+		user => "<YOUR_ELASTIC_USER>"
+		password => "<YOUR_ELASTIC_PASSWORD>"
+		
+	}
+}
